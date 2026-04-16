@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+
+# the dataset so it doesnt try to push to repo
 *.csv
 
 # Distribution / packaging
