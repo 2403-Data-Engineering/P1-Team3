@@ -9,9 +9,18 @@
   - Run the database_creation.py script to initialize the DB.
 
 
-Node : Accounts - nameOrig / nameDest
-    Holds all the other data
+Node : Accounts
+    Represents both customers and merchants
+    From:
+        nameOrig (sender)
+        nameDest (receiver)
 
 Edges : Transactions
     Payment, Transfer, Cash_out, Debit
     Holds all the other data
+
+Each row = one relationship (edge)
+
+(:Account)-[:TRANSFER {step: 1}]->(:Account)
+ means:
+“this transaction happened in hour 1 of the simulation”

@@ -3,6 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+Output_Parquet/
+
 # C extensions
 *.so
 

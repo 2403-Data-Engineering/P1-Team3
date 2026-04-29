@@ -23,7 +23,9 @@ def main():
 
 
     with driver.session() as session:
-
+# importing with neo4j doesn't do MERGE
+# One is a source one is destination
+# I have less nodes
         session.run ("CREATE INDEX FOR (a:Account) ON (a.id);")
 
         session.run("\
@@ -45,7 +47,10 @@ def main():
             "
         )
 
-
+# The data in the CSV is all transactions, none of those rows are about accounts. 
+# We derive the accounts from the source and destination IDs in the transactions. 
+# If an account is part of multiple transactions, 
+# that's going to generate duplicate nodes. We need to MERGE them.
 
 
     driver.close()
