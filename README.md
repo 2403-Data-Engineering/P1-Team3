@@ -28,3 +28,5 @@ Each row = one relationship (edge)
 (:Account)-[:TRANSFER {step: 1}]->(:Account)
  means:
 “this transaction happened in hour 1 of the simulation”
+
+- See specifications.md for detailed system requirements and design decisions.
