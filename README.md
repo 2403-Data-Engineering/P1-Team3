@@ -1,5 +1,9 @@
 # P1-Team3
 
+- Project Overview
+
+This project builds a graph-based fraud detection system using transaction data from the PaySim dataset. The system models financial transactions as a graph in Neo4j and applies graph analytics to detect suspicious behavior patterns such as fraud rings and anomalous transaction flows. Results are visualized using Power BI dashboards for interactive analysis.
+
 - Members: Silas Bucur, Seth Gleason, Sai Palepu
 
 - Neo4J setup:
