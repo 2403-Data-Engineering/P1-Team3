@@ -3,6 +3,7 @@ charset-normalizer==3.4.7
 colorama==0.4.6
 dotenv==0.9.9
 idna==3.11
+jsonschema==4.25.1
 kagglehub @ git+https://github.com/Kaggle/kagglehub.git@76690ea00850b300bb914dab94287e6933b7900c
 kagglesdk==0.1.18
 neo4j==6.1.0
@@ -10,6 +11,7 @@ numpy==2.4.4
 packaging==26.0
 pandas==3.0.2
 protobuf==7.34.1
+pytest==8.4.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 pytz==2026.1.post1

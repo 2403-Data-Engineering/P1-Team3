@@ -10,6 +10,9 @@ Output_Parquet/
 
 # the dataset so it doesnt try to push to repo
 *.csv
+!tests/fixtures/
+!tests/fixtures/*.csv
+eval/*.csv
 
 # Distribution / packaging
 .Python

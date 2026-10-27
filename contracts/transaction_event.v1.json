@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://p1-team3.local/contracts/transaction_event.v1.json",
+  "title": "PaySim transaction event v1",
+  "description": "Versioned operational event for CSV replay and a future live producer. Ground-truth fraud labels are not part of this contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "txn_id",
+    "source_file",
+    "row_number",
+    "ingested_at",
+    "source_step",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Stable event identity. For v1 CSV replay this equals txn_id so retries dedupe."
+    },
+    "txn_id": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Idempotency key for facts and graph relationships. SHA-256 hex of canonical PaySim fields + source_file basename + row_number."
+    },
+    "source_file": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Basename of the source CSV (path is not part of the identity)."
+    },
+    "row_number": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based data row index (header is row 0 / not counted)."
+    },
+    "ingested_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Ingestion timestamp (UTC). Not part of txn_id."
+    },
+    "source_step": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "PaySim ordinal hour. Preserved separately from ingested_at."
+    },
+    "payload": {
+      "$ref": "#/$defs/paysim_payload"
+    }
+  },
+  "$defs": {
+    "paysim_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "type",
+        "amount",
+        "nameOrig",
+        "oldbalanceOrg",
+        "newbalanceOrig",
+        "nameDest",
+        "oldbalanceDest",
+        "newbalanceDest"
+      ],
+      "properties": {
+        "step": { "type": "integer", "minimum": 1 },
+        "type": {
+          "type": "string",
+          "enum": ["CASH_IN", "CASH_OUT", "DEBIT", "PAYMENT", "TRANSFER"]
+        },
+        "amount": { "type": "number", "minimum": 0 },
+        "nameOrig": { "type": "string", "minLength": 1 },
+        "oldbalanceOrg": { "type": "number", "minimum": 0 },
+        "newbalanceOrig": { "type": "number", "minimum": 0 },
+        "nameDest": { "type": "string", "minLength": 1 },
+        "oldbalanceDest": { "type": ["number", "null"], "minimum": 0 },
+        "newbalanceDest": { "type": ["number", "null"], "minimum": 0 }
+      }
+    }
+  }
+}

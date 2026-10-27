@@ -1,5 +1,9 @@
 # Team 3's Cypher Queries
 
+Runnable required-signal order (T0.4): `detection/required_signals.cypher` via `python -m detection.pipeline`. That file adds Louvain `community_id`, SETs `fan_out_flag`, and writes `risk_score`. Stretch node-similarity queries below are not part of the runner.
+
+---
+
 ## Unusual Fan-out
 <pre>
 CALL gds.graph.project(
