@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+backend.hcl
+crash.log
+crash.*.log
+# Keep .terraform.lock.hcl: provider versions/checksums are reproducibility metadata.

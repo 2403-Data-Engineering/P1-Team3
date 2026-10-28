@@ -78,5 +78,6 @@ def test_run_cypher_pipeline_executes_steps_in_order():
     assert any("fan_out_flag" in stmt for stmt in executed)
     assert any("risk_score" in stmt for stmt in executed)
     louvain_at = next(i for i, stmt in enumerate(executed) if "louvain.write" in stmt)
-    dense_at = next(i for i, stmt in enumerate(executed) if "dense_community_flag" in stmt)
-    assert louvain_at < dense_at
+    reset_at = next(i for i, stmt in enumerate(executed) if "a.dense_community_flag = null" in stmt)
+    dense_at = next(i for i, stmt in enumerate(executed) if "SET a.dense_community_flag = 1" in stmt)
+    assert reset_at < louvain_at < dense_at

@@ -1,419 +1,280 @@
+"""Read-only, batched local Neo4j export of the complete Parquet star schema.
+
+Imports are side-effect free. Runtime dependencies and environment credentials
+are loaded only by main(); fixtures inject a reader and a Spark-compatible sink.
+See docs/STAR_SCHEMA.md for types, output safety and verification boundaries.
 """
-Extract data from Neo4j and write as partitioned Parquet star schema.
+from __future__ import annotations
 
-SCALABLE VERSION — for full PaySim or anything large.
-
-Key difference from the demo extract_to_parquet.py:
-  - Reads transactions in batches using KEYSET PAGINATION (not SKIP/LIMIT)
-  - Writes each batch to Parquet incrementally (append mode)
-  - Memory stays bounded at ~one batch worth of data, regardless of total size
-
-Why not SKIP/LIMIT?
-  Cypher executes `SKIP n` by scanning n rows and discarding them. As the
-  offset grows, each batch gets slower. For millions of rows, the last
-  batches take forever. Keyset pagination tracks the last ID seen and
-  asks for "the next batch where id > last_id" — constant cost per batch.
-
-Why elementId() and not id()?
-  id() is deprecated in Neo4j 5+. elementId() is the current API. Returns
-  a string instead of an integer; ordering is lexicographic but stable
-  and unique, which is all we need for cursor-based pagination.
-
-What students need to customize for their project:
-  - Add their derived node properties (fraud_score, fan_in, etc.) to the
-    accounts query RETURN clause and to ACCOUNT_SCHEMA
-  - Add their derived edge properties to the transactions query RETURN
-    clause and to TRANSACTION_BATCH_SCHEMA
-  - That's it. Everything else stays the same.
-"""
-
+import argparse
+import json
 import os
+import re
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
-# Spark needs to know which Python to use on Windows
-os.environ["PYSPARK_PYTHON"] = sys.executable
-os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-os.environ["PYSPARK_SUBMIT_ARGS"] = (
-    "--driver-memory 4g "
-    "--conf spark.sql.shuffle.partitions=50 "
-    "pyspark-shell"
+from contracts.transaction_event import (
+    GRAPH_SCORE_PROPERTY, PAYSIM_FIELD_ORDER, TRANSACTION_TYPE_KEYS,
+    build_transaction_event,
 )
+from pipeline.transform import date_dimension, event_to_fact, money, spark_schema as shared_schema
 
-from neo4j import GraphDatabase
-from pyspark.sql import SparkSession
-from pyspark.sql.types import (
-    StructType, StructField,
-    IntegerType, StringType, DoubleType, DateType,
+OUTPUT_DIR = Path("Output_Parquet")
+BATCH_SIZE = 25_000
+
+# Pure descriptors can be tested without importing PySpark or starting a JVM.
+ACCOUNT_FIELDS = (
+    ("account_id", "string", False),
+    ("community_id", "bigint", True),
+    ("community_total_amount", "decimal(38,10)", True),
+    ("community_transaction_count", "bigint", True),
+    ("outDegree", "double", True),
+    ("inDegree", "double", True),
+    ("fan_out_flag", "bigint", True),
+    ("fan_in_flag", "bigint", True),
+    ("unusualFanIn", "bigint", True),
+    ("drain_behavior_flag", "bigint", True),
+    ("dense_community_flag", "bigint", True),
+    ("transfer_cashout_flag", "bigint", True),
+    ("in_cycle_flag", "bigint", True),
+    ("guilt_by_association_flag", "bigint", True),
+    (GRAPH_SCORE_PROPERTY, "bigint", True),
 )
-
-# -------------------------------------------------------------
-# Config
-# -------------------------------------------------------------
-NEO4J_URI      = "neo4j://127.0.0.1:7687"
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "12345678"
-
-# Reference date that step=1 corresponds to (PaySim step is hours offset)
-START_DATE = datetime(2026, 3, 1)
-
-OUTPUT_DIR = Path("./Output_Parquet")
-
-# Batch size for transaction reads. Tune based on memory:
-#   - Larger = fewer round trips to Neo4j, more memory per batch
-#   - Smaller = more round trips, less memory pressure
-# 10k-50k is reasonable for typical hardware.
-BATCH_SIZE = 25000
-
-
-# -------------------------------------------------------------
-# Schemas — keep these in sync with the RETURN clauses below.
-# Define explicitly because Spark can't infer types when we append
-# DataFrames batch by batch (each batch must match the same schema).
-# -------------------------------------------------------------
-ACCOUNT_SCHEMA = StructType([
-    StructField("account_id", StringType(), False),
-    # ADD STUDENTS' DERIVED NODE PROPERTIES HERE, e.g.:
-    
-    StructField("community_id", IntegerType(), True), # whether a field can be null
-    # StructField("inDegree", IntegerType(), True),
-    StructField("community_total_amount", DoubleType(), True),
-    StructField("community_transaction_count", IntegerType(), True),
-    StructField("drain_behavior_flag", IntegerType(), True),
-    StructField("dense_community_flag", IntegerType(), True),
-    StructField("unusualFanIn", IntegerType(), True),
-    StructField("transfer_cashout_flag", IntegerType(), True), # inlcudes the recipient, not sender
-    StructField("guilt_by_association_flag", IntegerType(), True),
-
-    StructField("fraud_score", IntegerType(), True),
-    # StructField("fan_in",      IntegerType(), True),
-
-])
-
-# Transactions come back from Neo4j with a string cursor (elementId)
-# and the raw graph properties. We include the cursor in the schema
-# during the read, then drop it before writing Parquet.
-TRANSACTION_BATCH_SCHEMA = StructType([
-    StructField("cursor",         StringType(), False),
-    StructField("nameOrig",       StringType(), False),
-    StructField("nameDest",       StringType(), False),
-    StructField("step",           IntegerType(), False),
-    StructField("type",           StringType(), False),
-    StructField("amount",         DoubleType(),  False),
-    StructField("oldbalanceOrg",  DoubleType(),  False),
-    StructField("newbalanceOrig", DoubleType(),  False),
-    StructField("oldbalanceDest", DoubleType(),  False),
-    StructField("newbalanceDest", DoubleType(),  False),
-    # ADD STUDENTS' DERIVED EDGE PROPERTIES HERE
-])
-
-
-# -------------------------------------------------------------
-# Cypher queries
-# -------------------------------------------------------------
-
-# Accounts are typically a manageable size even at full scale (millions,
-# not billions). We pull them in one query. If account count is huge,
-# this could also be paginated with the same keyset pattern.
+ACCOUNT_COLUMNS = tuple(name for name, _, _ in ACCOUNT_FIELDS)
 ACCOUNTS_QUERY = """
 MATCH (a:Account)
 RETURN
-  a.id AS account_id,
-  // ADD DERIVED PROPERTIES HERE, e.g.:
-  a.community_id AS community_id,
-  a.community_total_amount AS community_total_amount,
-  a.community_transaction_count AS community_transaction_count,
-  a.drain_behavior_flag AS drain_behavior_flag,
-  a.dense_community_flag AS dense_community_flag,
-  a.unusualFanIn AS unusualFanIn,
-  a.transfer_cashout_flag AS transfer_cashout_flag,
-  a.guilt_by_association_flag AS guilt_by_association_flag,
-  a.fraud_score AS fraud_score
-ORDER BY a.id
-"""
+""" + ",\n".join(f"  a.{('id' if name == 'account_id' else name)} AS {name}"
+                  for name in ACCOUNT_COLUMNS) + "\nORDER BY a.id"
 
-# Keyset pagination: each call returns the next BATCH_SIZE transactions
-# with elementId greater than the last cursor we saw.
-# First call passes an empty string as the cursor (everything sorts after "").
+# Business-key keyset pagination. No Neo4j internal ID is exported or regenerated.
 TRANSACTIONS_QUERY = """
 MATCH (orig:Account)-[t:TRANSACTION]->(dest:Account)
-WHERE elementId(t) > $last_cursor
-RETURN
-  elementId(t)     AS cursor,
-  orig.id          AS nameOrig,
-  dest.id          AS nameDest,
-  t.step           AS step,
-  t.type           AS type,
-  t.amount         AS amount,
-  t.oldbalanceOrg  AS oldbalanceOrg,
-  t.newbalanceOrig AS newbalanceOrig,
-  t.oldbalanceDest AS oldbalanceDest,
-  t.newbalanceDest AS newbalanceDest
-  // ADD DERIVED EDGE PROPERTIES HERE
-ORDER BY elementId(t)
+WHERE t.txn_id > $last_txn_id
+RETURN t.txn_id AS txn_id, t.source_file AS source_file,
+       t.row_number AS row_number, orig.id AS nameOrig, dest.id AS nameDest,
+       t.step AS step, t.type AS type, t.amount AS amount,
+       t.oldbalanceOrg AS oldbalanceOrg, t.newbalanceOrig AS newbalanceOrig,
+       t.oldbalanceDest AS oldbalanceDest, t.newbalanceDest AS newbalanceDest,
+       t.transfer_cashout_flag AS transfer_cashout_flag
+ORDER BY t.txn_id
 LIMIT $batch_size
+"""
+COUNTS_QUERY = """
+MATCH (a:Account)
+WITH count(a) AS accounts, count(DISTINCT a.id) AS account_ids
+OPTIONAL MATCH ()-[t:TRANSACTION]->()
+RETURN accounts, account_ids, count(t) AS transactions,
+       count(DISTINCT t.txn_id) AS txn_ids,
+       count(CASE WHEN t IS NOT NULL AND t.txn_id IS NULL THEN 1 END) AS missing_txn_ids
 """
 
 
-# -------------------------------------------------------------
-# Step 1: Pull accounts (single query, build dim_account)
-# -------------------------------------------------------------
+def graph_counts(driver):
+    with driver.session(default_access_mode="READ") as session:
+        record = session.run(COUNTS_QUERY).single()
+        if record is None:
+            raise ValueError("graph count query returned no record")
+        counts = {name: int(record[name]) for name in
+                  ("accounts", "account_ids", "transactions", "txn_ids", "missing_txn_ids")}
+    if counts["missing_txn_ids"] or counts["transactions"] != counts["txn_ids"]:
+        raise ValueError("every TRANSACTION must have a unique txn_id before export")
+    if counts["accounts"] != counts["account_ids"]:
+        raise ValueError("every Account must have a unique non-null id before export")
+    return counts
+
+
+def _integer(value, name, *, minimum=0):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _flag(value, name):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if not isinstance(value, int) or value not in (0, 1):
+        raise ValueError(f"{name} must be null, 0 or 1")
+    return value
+
+
+def normalize_account(record):
+    account_id = record.get("account_id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise ValueError("account_id must be a nonempty string")
+    row = {"account_id": account_id}
+    for name, kind, _ in ACCOUNT_FIELDS[1:]:
+        value = record.get(name)
+        if value is None:
+            row[name] = None
+        elif name.endswith("_flag") or name == "unusualFanIn":
+            row[name] = _flag(value, name)
+        elif kind == "decimal(38,10)":
+            row[name] = money(value)
+        elif kind == "double":
+            import math
+            number = float(value)
+            if not math.isfinite(number) or number < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            row[name] = number
+        else:
+            row[name] = _integer(value, name)
+    return row
+
+
 def fetch_accounts(driver):
-    print("Fetching accounts...")
-    with driver.session() as session:
-        result = session.run(ACCOUNTS_QUERY)
-        rows = [tuple(r.values()) for r in result]
-    print(f"  Got {len(rows)} accounts")
+    with driver.session(default_access_mode="READ") as session:
+        rows = [normalize_account(dict(record)) for record in session.run(ACCOUNTS_QUERY)]
+    if len({row["account_id"] for row in rows}) != len(rows):
+        raise ValueError("duplicate account ID in export")
     return rows
 
 
-# -------------------------------------------------------------
-# Step 2: Stream transactions in batches, write each to Parquet.
-#
-# Returns the unique transaction types seen and the max step value,
-# both needed downstream to build dim_transaction_type and dim_date.
-# -------------------------------------------------------------
-def stream_transactions_to_parquet(driver, spark, output_path):
-    """
-    Read transactions in keyset-paginated batches.
-    Convert each batch to a Spark DataFrame and append to the Parquet output.
-    Track unique transaction types and max step seen for downstream dim tables.
-    """
-    last_cursor = ""  # empty string sorts before any real elementId
-    batch_num = 0
-    total_rows = 0
-    seen_types = set()
-    max_step = 0
+def transaction_to_fact(record):
+    txn_id = record.get("txn_id")
+    if not isinstance(txn_id, str) or re.fullmatch("[a-f0-9]{64}", txn_id) is None:
+        raise ValueError("TRANSACTION needs a contract txn_id")
+    if not isinstance(record.get("source_file"), str) or not record["source_file"]:
+        raise ValueError("TRANSACTION needs source_file audit metadata")
+    row_number = _integer(record.get("row_number"), "row_number", minimum=1)
+    event = build_transaction_event(
+        {name: record.get(name) for name in PAYSIM_FIELD_ORDER},
+        source_file=record["source_file"], row_number=row_number,
+        ingested_at=datetime(1970, 1, 1, tzinfo=timezone.utc),  # Excluded from facts/identity.
+    )
+    if event["txn_id"] != txn_id:
+        raise ValueError("stored txn_id disagrees with contract payload/audit coordinates")
+    fact = event_to_fact(event)
+    fact["transfer_cashout_flag"] = _flag(record.get("transfer_cashout_flag"), "transfer_cashout_flag")
+    fact["date"] = date.fromisoformat(date_dimension([fact["step"]])[0]["date"])
+    return fact
 
-    print(f"Streaming transactions in batches of {BATCH_SIZE}...")
 
+def transaction_batches(driver, batch_size=BATCH_SIZE):
+    _integer(batch_size, "batch_size", minimum=1)
+    last_txn_id = ""
     while True:
-        with driver.session() as session:
-            result = session.run(
-                TRANSACTIONS_QUERY,
-                last_cursor=last_cursor,
-                batch_size=BATCH_SIZE,
-            )
-            # Materialize this batch immediately. Driver's lazy result
-            # ties up the session connection; we want it freed.
-            batch = [
-                (
-                    r["cursor"],
-                    r["nameOrig"],
-                    r["nameDest"],
-                    int(r["step"]),
-                    r["type"],
-                    float(r["amount"]),
-                    float(r["oldbalanceOrg"]),
-                    float(r["newbalanceOrig"]),
-                    float(r["oldbalanceDest"]),
-                    float(r["newbalanceDest"])
-                )
-                for r in result
-            ]
-
-        if not batch:
-            break  # no more data, we're done
-
-        # Track values needed for downstream dim tables
-        for row in batch:
-            seen_types.add(row[4])      # type column
-            if row[3] > max_step:       # step column
-                max_step = row[3]
-
-        # Build a Spark DataFrame for this batch and append to Parquet.
-        # The first batch creates the directory; subsequent batches append.
-        df = spark.createDataFrame(batch, schema=TRANSACTION_BATCH_SCHEMA)
-        # Drop the cursor — it was only needed for pagination, not output
-        df = df.drop("cursor")
-
-        write_mode = "overwrite" if batch_num == 0 else "append"
-        (df.write
-            .mode(write_mode)
-            .option("compression", "snappy")
-            .parquet(str(output_path)))
-
-        # Advance the cursor to the last elementId we saw.
-        # Next iteration picks up from there.
-        last_cursor = batch[-1][0]
-        batch_num += 1
-        total_rows += len(batch)
-        print(f"  batch {batch_num}: {len(batch)} rows (total: {total_rows})")
-
-    print(f"Done streaming. {total_rows} transactions written across {batch_num} batches.")
-    return seen_types, max_step
+        with driver.session(default_access_mode="READ") as session:
+            records = [dict(record) for record in session.run(
+                TRANSACTIONS_QUERY, last_txn_id=last_txn_id, batch_size=batch_size)]
+        if not records:
+            return
+        batch = []
+        for record in records:
+            row = transaction_to_fact(record)
+            if row["txn_id"] <= last_txn_id:
+                raise ValueError("transaction cursor did not advance in unique txn_id order")
+            last_txn_id = row["txn_id"]
+            batch.append(row)
+        yield batch
 
 
-# -------------------------------------------------------------
-# Step 3: Build the small dim tables (account, type, date) and write them.
-# These are small enough to handle in one shot regardless of fact size.
-# -------------------------------------------------------------
-def write_dim_account(spark, account_rows, output_path):
-    print("Writing dim_account...")
-    df = spark.createDataFrame(account_rows, schema=ACCOUNT_SCHEMA)
-    (df.coalesce(1)
-        .write.mode("overwrite")
-        .option("compression", "snappy")
-        .parquet(str(output_path)))
+def schema_for(table):
+    from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, DecimalType, DateType
+    if table == "dim_account":
+        types = {"string": StringType(), "bigint": LongType(),
+                 "double": DoubleType(), "decimal(38,10)": DecimalType(38, 10)}
+        return StructType([StructField(name, types[kind], nullable) for name, kind, nullable in ACCOUNT_FIELDS])
+    if table == "fact_transactions":
+        return StructType([*shared_schema(table).fields,
+                           StructField("transfer_cashout_flag", LongType(), True),
+                           StructField("date", DateType(), False)])
+    return shared_schema(table)
 
 
-def write_dim_transaction_type(spark, seen_types, output_path):
-    print("Writing dim_transaction_type...")
-    rows = [(i + 1, name) for i, name in enumerate(sorted(seen_types))]
-    schema = StructType([
-        StructField("type_key",  IntegerType(), False),
-        StructField("type_name", StringType(),  False),
-    ])
-    df = spark.createDataFrame(rows, schema=schema)
-    (df.coalesce(1)
-        .write.mode("overwrite")
-        .option("compression", "snappy")
-        .parquet(str(output_path)))
+def write_table(spark, table, rows, output, *, mode="errorifexists"):
+    if table == "dim_date":
+        rows = [dict(row, date=date.fromisoformat(row["date"])) for row in rows]
+    writer = spark.createDataFrame(rows, schema=schema_for(table)).write.mode(mode).option("compression", "snappy")
+    if table == "fact_transactions":
+        writer = writer.partitionBy("date")
+    writer.parquet(str(output / table))
 
 
-def write_dim_date(spark, max_step, output_path):
-    print(f"Writing dim_date for {max_step} steps...")
-    rows = []
-    for step in range(1, max_step + 1):
-        dt = START_DATE + timedelta(hours=step - 1)
-        rows.append((
-            step,
-            dt.strftime("%Y-%m-%d %H:00:00"),
-            dt.date(),
-            dt.hour,
-            dt.strftime("%A"),
-        ))
-    schema = StructType([
-        StructField("date_key",    IntegerType(), False),
-        StructField("datetime",    StringType(),  False),
-        StructField("date",        DateType(),    False),
-        StructField("hour",        IntegerType(), False),
-        StructField("day_of_week", StringType(),  False),
-    ])
-    df = spark.createDataFrame(rows, schema=schema)
-    (df.coalesce(1)
-        .write.mode("overwrite")
-        .option("compression", "snappy")
-        .parquet(str(output_path)))
-
-
-# -------------------------------------------------------------
-# Step 4: Re-read the streamed fact table, partition it by date, rewrite.
-#
-# Why this extra step?
-#   When streaming, we appended unpartitioned Parquet for simplicity.
-#   To get partitioned-by-date layout (for Power BI partition pruning),
-#   we re-read the data, join in dim_date for the `date` column, and
-#   write again with partitionBy("date").
-#
-#   Alternative: partition during streaming by writing each batch directly
-#   into date=YYYY-MM-DD/ folders. More efficient (no second pass) but
-#   more code complexity. For students learning the pattern, the two-pass
-#   version is clearer.
-# -------------------------------------------------------------
-def repartition_fact_by_date(spark, raw_path, dim_date_path, final_path):
-    print("Repartitioning fact table by date...")
-    fact = spark.read.parquet(str(raw_path))
-    dim_date = spark.read.parquet(str(dim_date_path))
-
-    # Map step -> date via dim_date (PaySim's step IS our date_key)
-    fact_with_date = fact.join(
-        dim_date.select(dim_date.date_key.alias("step"), "date"),
-        on="step",
-        how="inner",
-    )
-
-    (fact_with_date
-        .write.mode("overwrite")
-        .option("compression", "snappy")
-        .partitionBy("date")
-        .parquet(str(final_path)))
-
-
-# -------------------------------------------------------------
-# Main
-# -------------------------------------------------------------
-# def main():
-#     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    
-
-#     print(f"Connecting to {NEO4J_URI}...")
-#     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-#     print("Starting Spark session...")
-#     spark = (
-#         SparkSession.builder
-#         .appName("neo4j-to-parquet-batched")
-#         # .config("spark.sql.shuffle.partitions", "50") #spark tuning
-#         # .config("spark.driver.memory", "4g") #spark tuning
-#         .getOrCreate()
-#     )
-
-#     # Output paths
-#     dim_account_path = OUTPUT_DIR / "dim_account"
-#     dim_type_path    = OUTPUT_DIR / "dim_transaction_type"
-#     dim_date_path    = OUTPUT_DIR / "dim_date"
-#     fact_raw_path    = OUTPUT_DIR / "_fact_transactions_raw"  # intermediate
-#     fact_final_path  = OUTPUT_DIR / "fact_transactions"       # partitioned
-
-#     # 1. Accounts — single read
-#     accounts = fetch_accounts(driver)
-#     write_dim_account(spark, accounts, dim_account_path)
-
-#     # 2. Transactions — streamed in batches, written incrementally
-#     seen_types, max_step = stream_transactions_to_parquet(
-#         driver, spark, fact_raw_path
-#     )
-
-#     driver.close()
-
-#     # 3. Dim tables that depend on what we saw during streaming
-#     write_dim_transaction_type(spark, seen_types, dim_type_path)
-#     write_dim_date(spark, max_step, dim_date_path)
-
-#     # 4. Repartition the fact table by date (joins with dim_date)
-#     repartition_fact_by_date(spark, fact_raw_path, dim_date_path, fact_final_path)
-
-#     # Cleanup intermediate
-#     print("Cleaning up intermediate files...")
-#     import shutil
-#     shutil.rmtree(fact_raw_path, ignore_errors=True)
-
-#     print(f"\nDone. Output: {OUTPUT_DIR.resolve()}")
-#     spark.stop()
-
-
-# if __name__ == "__main__":
-#     main()
-
-# Only write the dim_account again
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    print(f"Connecting to {NEO4J_URI}...")
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-    print("Starting Spark session...")
-    spark = (
-        SparkSession.builder
-        .appName("neo4j-to-parquet-dim-account-only")
-        .getOrCreate()
-    )
-
-    # Output path (ONLY this one matters now)
-    dim_account_path = OUTPUT_DIR / "dim_account"
-
-    # 🔹 Rebuild ONLY dim_account
-    print("Rebuilding dim_account with new columns...")
+def export_star_schema(driver, spark, output=OUTPUT_DIR, *, batch_size=BATCH_SIZE):
+    """Write once to a NEW local directory; counts and completion marker guard use."""
+    output = Path(output)
+    if output.exists():
+        raise FileExistsError("output already exists; choose a new export directory")
+    expected = graph_counts(driver)
     accounts = fetch_accounts(driver)
-    write_dim_account(spark, accounts, dim_account_path)
+    if len(accounts) != expected["accounts"]:
+        raise ValueError("account count changed before export")
+    account_ids = {row["account_id"] for row in accounts}
+    output.mkdir(parents=True, exist_ok=False)
+    incomplete = output / "_EXPORT_INCOMPLETE"
+    incomplete.touch()
+    write_table(spark, "dim_account", accounts, output)
+    total, steps = 0, set()
+    for batch in transaction_batches(driver, batch_size):
+        if any(row[key] not in account_ids for row in batch for key in ("nameOrig", "nameDest")):
+            raise ValueError("fact references an account missing from dim_account")
+        write_table(spark, "fact_transactions", batch, output,
+                    mode="errorifexists" if total == 0 else "append")
+        total += len(batch)
+        steps.update(row["step"] for row in batch)
+    if total == 0:
+        write_table(spark, "fact_transactions", [], output)
+    types = [{"type_key": key, "type_name": name} for name, key in TRANSACTION_TYPE_KEYS.items()]
+    dates = date_dimension(steps)
+    write_table(spark, "dim_transaction_type", types, output)
+    write_table(spark, "dim_date", dates, output)
+    if total != expected["transactions"] or graph_counts(driver) != expected:
+        raise ValueError("graph counts changed or transaction export is incomplete")
+    counts = {"dim_account": len(accounts), "fact_transactions": total,
+              "dim_transaction_type": len(types), "dim_date": len(dates)}
+    for table, count in counts.items():
+        if spark.read.parquet(str(output / table)).count() != count:
+            raise ValueError(f"written row count disagrees for {table}")
+    (output / "_EXPORT_COMPLETE.json").write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
+    incomplete.unlink()
+    return counts
 
-    driver.close()
 
-    print(f"\nDone. Updated: {dim_account_path.resolve()}")
-    spark.stop()
+def create_driver():
+    from dotenv import load_dotenv
+    from neo4j import GraphDatabase
+    from database_creation_script import neo4j_connect_args
+    load_dotenv()
+    uri, user, password = neo4j_connect_args()
+    if urlsplit(uri).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("export requires a local loopback Neo4j endpoint")
+    return GraphDatabase.driver(uri, auth=(user, password))
+
+
+def create_spark():
+    from pyspark.sql import SparkSession
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    return SparkSession.builder.master("local[2]").appName("neo4j-star-schema").getOrCreate()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    args = parser.parse_args(argv)
+    if args.output.exists():
+        raise FileExistsError("output already exists; choose a new export directory")
+    _integer(args.batch_size, "batch_size", minimum=1)
+    driver = spark = None
+    try:
+        driver = create_driver()
+        spark = create_spark()
+        counts = export_star_schema(driver, spark, args.output, batch_size=args.batch_size)
+        print(json.dumps(counts, sort_keys=True))  # No connection details or credentials.
+        return counts
+    finally:
+        try:
+            if driver is not None:
+                driver.close()
+        finally:
+            if spark is not None:
+                spark.stop()
 
 
 if __name__ == "__main__":

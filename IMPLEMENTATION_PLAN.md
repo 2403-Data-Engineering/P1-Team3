@@ -1,378 +1,178 @@
-# Implementation plan: hybrid AWS stream-and-batch migration
+# Implementation plan: PaySim fraud pipeline migration (thin-slice edition)
 
-Architecture source of truth: `PLAN.md`. Do not replace that design.
+Architecture target: `PLAN.md` (do not modify). Evidence and reasoning: `docs/MIGRATION_REVIEW.md` (open only the correction IDs a task cites, e.g. C2, C8). Current state: `AGENT_HANDOFF.md`.
 
-This file tracks small, testable tasks for separate agent sessions. Status values: `todo` | `in_progress` | `verified`.
+Status values: `todo` | `in_progress` | `verified`. Code-complete work awaiting live verification stays `in_progress`.
 
-**Rules for each session:** read `PLAN.md`, this file, and `AGENT_HANDOFF.md`. Implement only the assigned task ID. Do not apply Terraform, start paid AWS services, or push git unless the user explicitly asks. Do not copy secrets into docs or code comments.
+## Rules for every session
 
-**Local-first:** complete Phase 0 (T0.1–T0.6) before introducing AWS services (Phase 2+). T2.1 may *design* IaC in parallel after T0.1, but must not `apply` until the user approves spend.
+- Read `AGENT_HANDOFF.md` and **only the assigned task's section** of this file. Don't read the whole repo; open only the files the task lists.
+- Implement only the assigned task ID. Stop as soon as its acceptance criteria pass. No extra refactors or summaries.
+- Check git status against the handoff before starting. If the handoff and the repo disagree in a way that affects the task, stop and say so.
+- Never `terraform apply`/`destroy`, start paid AWS services, commit, or push unless the task's Permissions line explicitly allows it.
+- Never put credentials in files, logs, or docs.
+- Update `AGENT_HANDOFF.md` at the end: what changed, tests run, issues, next task ID.
+
+## Scope decisions (locked; change only on purpose)
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Dataset for cloud work | Sample of ~100K PaySim rows, taken by a fixed rule so it is reproducible. Full 6.3M rows is out of scope. | Cost and agent-credit budget |
+| Reporting target (first pass) | Athena over curated Parquet in S3. Redshift is stretch task S2. | Pay-per-query, near zero cost at this size |
+| Neo4j | Runs locally. T1 writes a short Aura vs AWS-hosted decision note but provisions nothing. | Avoids hosting cost |
+| Streaming (Kinesis + Lambda) | Stretch task S1, run briefly on the sample, then torn down. The batch path ships first. | Batch already proves the contract, curated grain, and reporting |
+| Score name | `risk_score` (locked in T0.1) | |
+| Ground-truth fraud rate | From the eval sidecar only (locked in T0.2) | |
+
+`PLAN.md` remains the target architecture. This plan builds its batch half and the reporting layer first, and adds streaming as a stretch. The final write-up (T5) should say so plainly.
+
+## Mapping from the earlier task list
+
+| Earlier IDs | Now |
+|---|---|
+| T0.1, T0.2 | unchanged (verified) |
+| T0.3, T0.4, T0.5 | unchanged; T1.1 (type lock) merged into T0.5 |
+| T0.6 | dropped (the handoff is updated every session) |
+| T2.1, T2.2, T4.1 | T1 |
+| T4.2, T4.4 (batch part) | T2 |
+| T5.1, T5.2, T5.3 | T3 |
+| T6.1 (Athena), T6.2 | T4 |
+| T7.1 | T5 |
+| T3.1-T3.3, T4.3, T4.4 (stream part) | S1 (stretch) |
+| T3.4 | dropped; the batch loader from T0.3 serves the demo |
+| T6.1 (Redshift) | S2 (stretch) |
 
 ---
 
-## Phase 0 — Local foundations (before AWS)
+## Phase 0: Local foundations
 
-### T0.1 — Event and data contracts
+T0.3 live check, T0.4 live run, T0.5 live export, and live T3 are deferred until Neo4j is available: no local Neo4j environment variables and no unlabeled ops CSV were configured. Repo-only T5 is complete; no next task is authorized. T0.5/T2/T3/T4 remain fixture-tested code only; live checks, T1 plan and provisioning remain pending before any future cloud execution.
 
+### T0.1 - Event and data contracts
+**Status:** verified
+
+### T0.2 - Evaluation-label sidecar
+**Status:** verified
+
+### T0.3 - Idempotent local Neo4j load
 | Field | Value |
 |---|---|
-| **Status** | verified |
-| **Objective** | Define a versioned transaction event containing PaySim fields, source step, ingestion timestamp, and a stable event/transaction ID. Define merchant-balance nulls and idempotency/dedup rules as code plus tests. |
-| **Inspect** | `PLAN.md` (step 1), `download_data.py`, `Fraud-Reference.md`, `batching_python_driver.py` (schemas), `docs/MIGRATION_REVIEW.md` (C1, C3) |
-| **Modify** | None required beyond new contract/test files unless a tiny shared module is added under `contracts/` |
-| **New files (expected)** | `contracts/transaction_event.v1.json` (or equivalent Pydantic), `tests/test_txn_id.py`, tiny fixture CSV under `tests/fixtures/` |
-| **Depends on** | None |
-| **Approach** | Canonical fields + `source_file` + `row_number` hashed into `txn_id`; keep audit attributes. Schema version on every event. Tests for duplicate-looking rows, CSV re-sort, merchant nulls, malformed rejection. Do not use Neo4j `elementId` as a business key. |
-| **Acceptance** | Deterministic IDs; same logical row → same `txn_id` on replay; merchant dest balances are null not zero; schema rejects malformed records; no AWS. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | Yes, with T0.6 |
+| **Status** | in_progress — code-complete (mock-tested); live Neo4j verification pending |
+| **Objective** | Replay-safe graph ingest. Loading the ops CSV twice gives identical node and relationship counts. |
+| **Files** | `database_creation_script.py`; reuse `txn_id` from `contracts/` |
+| **Approach** | Unique constraint on `Account.id`. Transaction identity by relationship uniqueness if the local Neo4j version supports it, otherwise a `:Transaction` node with a unique `txn_id`. MERGE, not CREATE. Credentials from environment only. Ingest the unlabeled CSV, never the eval sidecar. Document which identity model was chosen and why. |
+| **Acceptance** | Double load leaves counts unchanged; constraints exist; no hardcoded secrets; test covers the double load. |
+| **AWS / cost** | No / No |
+| **Permissions** | Local Neo4j read/write via environment credentials. Confirm the instance is local and describe any write before running it. Don't delete data without asking. |
 
-### T0.2 — Evaluation-label sidecar
-
+### T0.4 - Required detection signals
 | Field | Value |
 |---|---|
-| **Status** | verified |
-| **Objective** | Keep `isFraud` / `isFlaggedFraud` off the operational scoring path while retaining a joinable eval dataset for ground-truth reporting. |
-| **Inspect / modify** | `download_data.py` |
-| **New files (expected)** | Eval layout documentation; gitignored data path (e.g. `eval/`); tests that ops CSV has no label columns |
-| **Depends on** | T0.1 (shared `txn_id` field names) |
-| **Approach** | Write unlabeled ops CSV as today; write labeled eval file keyed by `txn_id`. Never load labels into Neo4j or the operational event stream. |
-| **Acceptance** | Ops output has no label columns; eval joins 1:1 on `txn_id`; unit test covers both. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | After T0.1, yes with T0.3 (different files) |
+| **Status** | in_progress — code-complete (mock-tested); live Neo4j verification pending |
+| **Objective** | Make the required Fraud-Reference signals runnable as a script instead of manual Browser steps. |
+| **Files** | `cypher_queries.md`, `Fraud-Reference.md`; new `detection/` runner |
+| **Approach** | Louvain writes `community_id` before the dense-community queries. SET `fan_out_flag` from the p99 threshold. Compute and write `risk_score` per `Fraud-Reference.md`. Unify property names (`unusualFanIn` etc.). Drain logic must ignore merchant destination balances (C8). Stretch signals (similarity, PageRank, betweenness) stay out of scope. |
+| **Acceptance** | A small fixture graph produces the expected flags and `risk_score`; `fan_out_flag` is actually set; Louvain runs before community queries; property names match the export schema. |
+| **AWS / cost** | No / No |
+| **Permissions** | Local Neo4j read/write with GDS via environment credentials. Prefer the fixture graph first. Describe writes to the main graph before running them. |
 
-### T0.3 — Idempotent local Neo4j load
-
+### T0.5 - Local star-schema baseline (the oracle)
 | Field | Value |
 |---|---|
-| **Status** | verified |
-| **Objective** | Replay-safe graph ingest: uniqueness constraints and MERGE on `txn_id` so retries do not create duplicate TRANSACTION relationships. |
-| **Inspect / modify** | `database_creation_script.py` |
-| **New files (expected)** | Tests for double-load counts; optional Cypher constraint script |
-| **Depends on** | T0.1; T0.2 recommended so ingest uses the ops (unlabeled) file |
-| **Approach** | Unique `Account.id`. Unique transaction identity via relationship uniqueness if the Neo4j version supports it, otherwise a `:Transaction` node with unique `txn_id`. Credentials only from environment variables. |
-| **Acceptance** | Load twice → same node and relationship counts. Env-only auth. No hardcoded secrets. |
-| **AWS needed?** | No |
-| **Cost?** | No (local Neo4j only) |
-| **Parallel-safe?** | Not with T0.4/T0.5 on the same database |
-
-### T0.4 — Required detection completeness
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Make required Fraud-Reference signals runnable and consistent: Louvain `community_id`, SET `fan_out_flag`, existing Cypher flags, write `risk_score` (name locked in T0.1 contract). |
-| **Inspect** | `cypher_queries.md`, `Fraud-Reference.md` |
-| **Modify** | `cypher_queries.md` and/or a new `detection/` runner |
-| **New files (expected)** | Ordered Cypher or Python detection runner; fixture-graph tests |
-| **Depends on** | T0.3 |
-| **Approach** | Script what is today manual Browser work. Stretch signals (node similarity, PageRank, betweenness, ring-to-ring) stay out of scope. Align property names with export schema. |
-| **Acceptance** | Fixture graph produces expected flags; `risk_score` present; fan-out flag actually SET; Louvain precedes dense-community queries. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | No with T0.5 on the same database |
-
-### T0.5 — Restore full Parquet star-schema baseline
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Re-enable the full local export (`dim_account`, `dim_transaction_type`, `dim_date`, `fact_transactions`) as the migration oracle. Include `txn_id`. Move credentials to env. |
-| **Inspect / modify** | `batching_python_driver.py`, `requirements.txt` |
-| **New files (expected)** | Optional star-schema note under `docs/`; export tests on a small graph |
-| **Depends on** | T0.1; T0.4 (flags/score on the graph) |
-| **Approach** | Restore commented full `main()`; add `txn_id` to fact grain; export relationship flags needed for reporting; add PySpark to deps or document the JVM requirement. |
-| **Acceptance** | All four tables written; row counts match Neo4j; facts have stable `txn_id`; no hardcoded Neo4j endpoints or passwords in source. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | After T0.4 only |
-
-### T0.6 — Session continuity docs
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Keep `IMPLEMENTATION_PLAN.md` and `AGENT_HANDOFF.md` accurate after each verified task (this file already exists; later sessions update status). |
-| **Inspect / modify** | `IMPLEMENTATION_PLAN.md`, `AGENT_HANDOFF.md` |
-| **Depends on** | This review (done). Ongoing after every task. |
-| **Approach** | After each task: set status, record tests, set next task ID. Do not rewrite `PLAN.md`. |
-| **Acceptance** | Handoff always names exactly one next task. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | Yes with T0.1 |
+| **Status** | in_progress — code-complete (fixture-tested; not run against Neo4j) |
+| **Objective** | Restore the full local export (`dim_account`, `dim_transaction_type`, `dim_date`, `fact_transactions`) so later cloud output has something to be compared against. Includes the type lock formerly in T1.1. |
+| **Files** | `batching_python_driver.py`, `requirements.txt` |
+| **Approach** | Re-enable the commented full `main()`. Add `txn_id` to the fact grain. Export relationship flags (e.g. `transfer_cashout_flag`). Read `risk_score`, not `fraud_score`. Freeze `type_key` as a fixed dictionary in the contract (C10). Document the column type mapping (decimal vs double, `step` handling, nullability). Replace the hardcoded Neo4j connection with environment variables (C11). Add pyspark to requirements or document the JVM requirement. |
+| **Acceptance** | All four tables written; row counts match Neo4j; facts carry `txn_id`; `type_key` is stable across runs; no hardcoded endpoints or passwords in source. |
+| **AWS / cost** | No / No |
+| **Permissions** | Read-only on local Neo4j. Writing Parquet to a local output folder is allowed, but don't overwrite existing output without asking. |
 
 ---
 
-## Phase 1 — PLAN step 1 (contracts)
+## Phase 1: AWS foundation (design first; apply only with approval)
 
-T0.1 *is* PLAN step 1. Optional follow-up:
-
-### T1.1 — Warehouse type lock
-
+### T1 - Terraform skeleton, buckets, catalog, budget, decision note
 | Field | Value |
 |---|---|
-| **Status** | todo |
-| **Objective** | Lock Glue/Redshift column types (decimal vs double, `step` vs timestamps, nullability) in the same contract package. |
-| **Inspect** | `contracts/` from T0.1, `batching_python_driver.py` Spark schemas |
-| **New files (expected)** | Warehouse/Glue schema companion in `contracts/` |
-| **Depends on** | T0.1 |
-| **Acceptance** | Single documented type mapping used by later Glue and Redshift tasks. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | Yes with remaining T0 work |
+| **Status** | in_progress — validate passed; AWS plan pending runtime account ID and budget alert recipient |
+| **Objective** | Minimum AWS foundation for the batch path, with cost controls and a destroy path. |
+| **Files (new)** | `infra/` (Terraform), `.env.example` with names only, a short Neo4j decision note in `docs/` |
+| **Approach** | Raw and curated S3 buckets with encryption and public-access block; a Glue database; a scoped IAM role for Glue; an AWS Budget alert at a low threshold; state backend settings with `use_lockfile`; tags on everything. Decision note: Aura vs AWS-hosted Neo4j (GDS availability, network path from cloud jobs, cost), with a recommendation but no provisioning. Document how to tear everything down. |
+| **Acceptance** | `terraform validate` and `terraform plan` succeed; plan output lists only expected resources; teardown steps documented; no credentials in git. |
+| **AWS / cost** | Design yes; apply only with approval. Low cost when applied (S3, catalog, IAM). |
+| **Permissions** | Write Terraform and run `validate` and `plan` only. No `apply` or `destroy` without my explicit go-ahead in that session, after a budget alert exists. |
 
 ---
 
-## Phase 2 — PLAN step 2: AWS foundation
+## Phase 2: Cloud batch path
 
-### T2.1 — IaC skeleton, IAM, secrets, logs, budget, teardown
-
+### T2 - Sample to S3 to curated Parquet (Glue batch)
 | Field | Value |
 |---|---|
-| **Status** | todo |
-| **Objective** | Scoped IAM, secrets management, encryption, logging, cost controls, and destroy path. Document env-specific config. Do not `apply` until the user approves. |
-| **Inspect** | `PLAN.md` step 2, `docs/MIGRATION_REVIEW.md` |
-| **New files (expected)** | `infra/` Terraform or CDK; `.env.example` with **names only** (no secret values) |
-| **Depends on** | T0.1 |
-| **Acceptance** | Plan/validate succeeds locally; README/infra notes say how to tear down; no credentials in git. |
-| **AWS needed?** | Design yes; apply only when user approves |
-| **Cost?** | Apply = yes; plan-only = no |
-| **Parallel-safe?** | After T0.1, yes with T0.3–T0.5 if apply is skipped |
-
-### T2.2 — Neo4j deployment choice (Aura vs AWS-hosted) + GDS
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Decision record: GDS availability, Glue/Lambda connectivity, security, cost. Do not provision until chosen. |
-| **Inspect** | `PLAN.md` decisions, `cypher_queries.md` (GDS usage) |
-| **New files (expected)** | Short decision note (e.g. in `docs/` or handoff) |
-| **Depends on** | None strictly; before T3.4 / T5.1 |
-| **Acceptance** | Written choice with GDS yes/no and network path. |
-| **AWS needed?** | Research only unless a trial is started |
-| **Cost?** | Only if a trial cluster is created |
-| **Parallel-safe?** | Yes with T2.1 |
+| **Status** | in_progress — code-complete (fixture-tested; not run in AWS) |
+| **Objective** | Take the reproducible ~100K-row sample through the contract into raw S3, then produce curated Parquet at the canonical `txn_id` grain plus dimensions. Reconcile against the T0.5 local baseline. |
+| **Files** | `contracts/`, T0.5 schemas and transforms (reuse types and transforms, not the Neo4j keyset-pagination loop); new `pipeline/` and a Glue job script |
+| **Approach** | One shared transform module used by both local runs and the Glue job. Raw events land in S3 with stable IDs. Glue batch job (smallest worker config) writes curated Parquet and registers tables. Reconciliation script compares counts and amount sums by `step` and `type` between local baseline and curated output. Duplicate-replay test: run twice, expect no duplicate facts. |
+| **Acceptance** | Curated tables match the contract; counts and sums reconcile with the local baseline; replaying the same input creates no duplicates; Glue job cost on the sample is noted. |
+| **AWS / cost** | Yes / Yes (Glue DPU-hours; keep runs few and small) |
+| **Permissions** | Apply or run only resources defined in T1, in my dev account. Before any Glue run, list what will run and its approximate cost, then wait for my yes. |
 
 ---
 
-## Phase 3 — PLAN step 3: streaming path
+## Phase 3: Graph results into reporting
 
-### T3.1 — Local producer using the event contract
-
+### T3 - Versioned graph export joined to curated data
 | Field | Value |
 |---|---|
-| **Status** | todo |
-| **Objective** | Replay PaySim CSV into versioned JSON events (file or moto), no live AWS required. |
-| **Inspect** | T0.1 contracts, `download_data.py` |
-| **New files (expected)** | `ingest/replay_producer.py` (or similar), tests |
-| **Depends on** | T0.1 |
-| **Acceptance** | Fixture CSV → valid events with stable IDs; second run same IDs. |
-| **AWS needed?** | No |
-| **Cost?** | No |
-| **Parallel-safe?** | Yes with T2.x (no apply) |
-
-### T3.2 — Kinesis + raw S3
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Publish replayed events to one Kinesis stream; persist raw events to S3 for audit/replay. |
-| **Inspect** | `PLAN.md` step 3, `infra/` |
-| **New files (expected)** | Producer config, Firehose or consumer-to-S3, IAM |
-| **Depends on** | T2.1 (applied), T3.1 |
-| **Acceptance** | Replay produces Kinesis records and raw S3 objects with `txn_id`. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes |
-| **Parallel-safe?** | No with other tasks that mutate the same stream/bucket without coordination |
-
-### T3.3 — Lambda validation, dedup, simple alerts (batched)
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Bounded validation, idempotent dedup, transaction-local rules, routing of alert candidates. Use Kinesis batch windows. Share the T0.1 transform library. |
-| **Inspect** | `PLAN.md` step 3, contracts |
-| **New files (expected)** | Lambda handler, unit tests with sample records |
-| **Depends on** | T3.2 |
-| **Acceptance** | Duplicate events do not create duplicate downstream facts; malformed records handled; no per-record GDS. Document alert latency and retries. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes |
-| **Parallel-safe?** | After T3.2; not with competing stream consumers unless documented |
-
-### T3.4 — Batched Neo4j graph-writer consumer
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Idempotent batched writes of new events into Neo4j. Reserve GDS for scheduled detection. |
-| **Inspect** | `database_creation_script.py` (after T0.3), T2.2 decision |
-| **Depends on** | T0.3, T2.2, T3.2 |
-| **Acceptance** | Replay twice → no duplicate relationships; writer uses MERGE on `txn_id`. |
-| **AWS needed?** | Yes (plus Neo4j) |
-| **Cost?** | Yes |
-| **Parallel-safe?** | Not with T5.1 on the same graph without locking a window |
+| **Status** | in_progress — code-complete (fixture-tested; not run live) |
+| **Objective** | Export graph-derived account, transaction, and ring signals with a detection run version, land them in S3, and join them to curated tables. |
+| **Files** | `detection/` from T0.4, `batching_python_driver.py` from T0.5 |
+| **Approach** | Every export carries `detection_run_id` and `detected_at`. Account-level signals join on `account_id`, transaction-level flags on `txn_id`. Detection runs on a schedule or window (never per event); document the window, since incremental Louvain communities can differ from full-graph ones. Required signals only. |
+| **Acceptance** | Reports can tell one detection run from another; edge flags (e.g. transfer-cashout) are available where the dashboard needs them; the joined result matches the local export for the sample. |
+| **AWS / cost** | S3 writes only / negligible |
+| **Permissions** | Read from local Neo4j; write to the S3 buckets from T1. |
 
 ---
 
-## Phase 4 — PLAN step 4: Glue batch and curated data
+## Phase 4: Reporting
 
-### T4.1 — Glue Data Catalog and S3 prefixes
-
+### T4 - Athena views and dashboard
 | Field | Value |
 |---|---|
-| **Status** | todo |
-| **Objective** | Catalog raw and curated datasets; define `raw/` and `curated/` prefixes. |
-| **Depends on** | T2.1 applied |
-| **Acceptance** | Tables/databases exist in Glue Catalog; paths documented. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes (catalog + S3) |
-| **Parallel-safe?** | Yes with T3.1 local producer |
-
-### T4.2 — Glue batch: S3 → canonical grain and dimensions
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Historical load and scheduled refresh to the same canonical transaction grain and dims (facts, accounts, types, dates) **without** requiring graph flags yet. |
-| **Inspect** | `batching_python_driver.py` schemas (reuse types, not Neo4j keyset pagination) |
-| **Depends on** | T0.1, T1.1 recommended, T4.1 |
-| **Acceptance** | Curated Parquet matches contract; counts reconcilable to source CSV by `txn_id`. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes (Glue DPU) |
-| **Parallel-safe?** | Not with T4.3 writing the same curated prefix |
-
-### T4.3 — Glue streaming or micro-batch (only if needed)
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Heavier stream transforms if T3 cannot land the curated grain. Same library as T4.2. |
-| **Depends on** | T4.2 (shared transforms), T3.2 |
-| **Acceptance** | Documented choice; if skipped, mark verified as “not needed” with evidence. |
-| **AWS needed?** | Yes if implemented |
-| **Cost?** | Yes if implemented |
-| **Parallel-safe?** | Coordinate with T4.2 outputs |
-
-### T4.4 — Batch vs stream reconciliation job
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Compare Glue batch output and streaming output at `txn_id` grain (counts, amount sums by `step` and `type`). |
-| **Depends on** | T4.2; T3.3 and/or T4.3 |
-| **Acceptance** | Job reports agreement or a bounded, explained diff. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes |
-| **Parallel-safe?** | After producers are stable |
+| **Status** | in_progress — code-complete (fixture-tested; not run in Athena) |
+| **Objective** | Answer the project's dashboard questions from Athena over curated and graph data, then connect Power BI (or a simpler dashboard if Power BI is not available). |
+| **Files** | `P1-specifications.md` (visual requirements) |
+| **Approach** | Athena views for KPIs, risk-score distribution, flagged volume over time, transaction-type comparison, riskiest accounts, and ring volume. Ground-truth fraud rate joins the eval sidecar only and never feeds scoring. Power BI in Import mode with scheduled refresh; DirectQuery only if freshness justifies the cost. |
+| **Acceptance** | Each required visual has a working query or report page; numbers match the curated tables; ground-truth rate is clearly separate from model flags. |
+| **AWS / cost** | Yes / low (Athena scans on a small sample) |
+| **Permissions** | Create Athena views and workgroup settings from T1's Terraform. Keep a scan-size limit on the workgroup. |
 
 ---
 
-## Phase 5 — PLAN step 5: Neo4j detection connected to reporting
+## Phase 5: Verify, tear down, document
 
-### T5.1 — Scheduled cloud detection
-
+### T5 - Final verification, teardown, and architecture write-up
 | Field | Value |
 |---|---|
-| **Status** | todo |
-| **Objective** | Port T0.4 Cypher/GDS to the chosen Neo4j; run on a schedule or incremental window, not per Kinesis record. |
-| **Inspect** | `cypher_queries.md`, `detection/` from T0.4 |
-| **Depends on** | T0.4, T2.2, T3.4 (graph has data) |
-| **Acceptance** | Detection run is versioned (`detection_run_id`, `detected_at`). |
-| **AWS needed?** | Yes (scheduler) + Neo4j |
-| **Cost?** | Yes |
-| **Parallel-safe?** | Not overlapping another GDS write on the same DB |
-
-### T5.2 — Export graph features and join to curated tables
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Export account/transaction/ring results to S3 and join to curated tables on `account_id` / `txn_id`. |
-| **Inspect** | `batching_python_driver.py` after T0.5 |
-| **Depends on** | T5.1, T4.2 |
-| **Acceptance** | Reports can distinguish a new detection run from a prior one; edge flags (e.g. transfer-cashout) available where required. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes |
-| **Parallel-safe?** | After T5.1 completes |
-
-### T5.3 — Scope: required signals only
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Confirm stretch signals are deferred; required dashboard fields are populated. |
-| **Depends on** | T5.2 |
-| **Acceptance** | Checklist vs `Fraud-Reference.md` primary signals and `P1-specifications.md` visuals. |
-| **AWS needed?** | No additional |
-| **Cost?** | No additional |
-| **Parallel-safe?** | Yes |
+| **Status** | verified — complete (repo-only delivery; no live verification or teardown performed) |
+| **Objective** | Finalize the repo-only delivery: fixture verification evidence, accurate README/architecture, names-only env configuration, ignore coverage and a future teardown runbook. |
+| **Approach** | User-approved repo-only adaptation: document what fixtures prove and what remains unverified. State explicitly that SQLite tests do not validate Athena Trino/Presto syntax/functions or Hive DDL. Update README and architecture mapping without modifying PLAN.md. Verify env/ignore/runbook coverage and rerun all tests. Nothing was deployed, so no live check or teardown is performed. |
+| **Acceptance** | Repo-only checklist signed off in AGENT_HANDOFF.md; 96 local tests pass; README/docs match current code and state live limits; names-only env example and secret/state ignore checks pass. No deployed-resource or account-wide teardown claim. |
+| **AWS / cost** | No / No (repo-only adaptation) |
+| **Permissions** | Local files only. No AWS, Neo4j, paid services, commits or pushes. Future live teardown requires explicit approval in that session. |
 
 ---
 
-## Phase 6 — PLAN step 6: Redshift and Power BI
+## Stretch tasks (only after T5, if credits and interest remain)
 
-### T6.1 — Load curated data into Redshift
+### S1 - Streaming slice (Kinesis, Lambda, reconciliation)
+Local replay producer first (no AWS), then a 1-shard Kinesis stream and a batched Lambda that validates and de-duplicates by `txn_id` and lands raw events in S3. Reconcile stream output against the batch output at `txn_id` grain by `step` and `type`. Run on the sample for a short window, then delete the stream. Needs explicit cost approval before any resource is created.
 
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | COPY or Spectrum from curated Parquet; dist/sort keys documented. Athena may be compared in prototype; Redshift remains the reporting target. |
-| **Depends on** | T4.2, T5.2 (for graph fields on reports), T1.1 |
-| **Acceptance** | Totals match curated S3 for transaction count and amount. Pause/delete procedure documented. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes — high if left running |
-| **Parallel-safe?** | After curated tables are stable |
-
-### T6.2 — Power BI Import mode and required visuals
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | Connect Power BI (Import, scheduled refresh). Recreate KPIs, risk-score distribution, flagged volume over time, transaction-type comparison, riskiest accounts, ring volume. DirectQuery only if freshness justifies cost. Ground-truth fraud-rate uses eval sidecar only. |
-| **Inspect** | `P1-specifications.md` |
-| **Depends on** | T6.1, T0.2 for ground-truth rate |
-| **Acceptance** | Dashboard answers the spec questions; refresh succeeds. |
-| **AWS needed?** | Yes (Redshift reachability) |
-| **Cost?** | Indirect (Redshift on) |
-| **Parallel-safe?** | After T6.1 |
+### S2 - Redshift load
+COPY or Spectrum from curated Parquet, with documented distribution and sort keys, and a pause/delete procedure. Compare against the Athena numbers. Needs explicit cost approval.
 
 ---
 
-## Phase 7 — PLAN step 7: migrate and verify
+## Out of scope
 
-### T7.1 — Incremental verification and teardown
-
-| Field | Value |
-|---|---|
-| **Status** | todo |
-| **Objective** | End-to-end checks from `PLAN.md` Verification, then resource teardown. |
-| **Inspect** | Local Parquet baseline (T0.5), curated S3, Neo4j, Redshift |
-| **Depends on** | T3.2, T4.4, T5.2, T6.2 |
-| **Approach** | (1) CSV replay → valid Kinesis + raw S3 with stable IDs. (2) Replay twice; no duplicate facts or graph rels. (3) Batch vs stream agreement. (4) Graph joins. (5) Redshift vs S3 vs local baseline. (6) Power BI. (7) IAM, logs, failure recovery, teardown. |
-| **Acceptance** | Checklist signed off in `AGENT_HANDOFF.md`; paid resources stopped or destroyed per user instruction. |
-| **AWS needed?** | Yes |
-| **Cost?** | Yes until teardown |
-| **Parallel-safe?** | No — final gate |
-
----
-
-## Dependency graph (summary)
-
-```
-T0.1 ─┬─ T0.2 ─ T0.3 ─ T0.4 ─ T0.5
-      ├─ T0.6 (ongoing)
-      ├─ T1.1
-      ├─ T2.1 ─ T3.2 ─┬─ T3.3
-      ├─ T3.1 ────────┘      └─ T3.4
-      └─ T2.2 ──────────────────┘
-T4.1 (after T2.1 apply) ─ T4.2 ─┬─ T4.3 (optional) ─ T4.4
-T0.4 + T2.2 + T3.4 ─ T5.1 ─ T5.2 ─ T5.3
-T4.2 + T5.2 + T1.1 ─ T6.1 ─ T6.2
-T4.4 + T5.2 + T6.2 ─ T7.1
-```
-
-## Out of scope (from PLAN.md)
-
-Replacing Neo4j, multi-region DR, ML model training, stretch GDS signals until required signals are done.
+Replacing Neo4j, multi-region DR, ML model training, stretch GDS signals (node similarity, PageRank, betweenness), full 6.3M-row cloud runs.

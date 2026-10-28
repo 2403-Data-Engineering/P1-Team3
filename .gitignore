@@ -213,3 +213,29 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# T5: local secrets and infrastructure artifacts, wherever generated.
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+backend.hcl
+backend.*.hcl
+crash.log
+crash.*.log
+
+# Offline quick-start outputs and optional local Spark artifacts.
+artifacts/
+Output_Parquet*/
+spark-warehouse/
+metastore_db/
+# Keep .terraform.lock.hcl and tests/fixtures/*.csv versionable.

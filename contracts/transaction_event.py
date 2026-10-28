@@ -37,6 +37,8 @@ import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from functools import lru_cache
+from importlib.resources import files
 from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -47,6 +49,7 @@ SCHEMA_PATH = Path(__file__).with_name("transaction_event.v1.json")
 TRANSACTION_TYPES = frozenset(
     {"CASH_IN", "CASH_OUT", "DEBIT", "PAYMENT", "TRANSFER"}
 )
+TRANSACTION_TYPE_KEYS = {"CASH_IN": 1, "CASH_OUT": 2, "DEBIT": 3, "PAYMENT": 4, "TRANSFER": 5}
 GRAPH_SCORE_PROPERTY = "risk_score"
 MERCHANT_ID_PREFIX = "M"
 
@@ -70,9 +73,11 @@ class TransactionEventError(ValueError):
 
 
 def load_event_schema() -> dict[str, Any]:
-    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    # Resource access also works inside the --extra-py-files ZIP used by Glue.
+    return json.loads(files("contracts").joinpath("transaction_event.v1.json").read_text(encoding="utf-8"))
 
 
+@lru_cache(maxsize=1)
 def event_validator() -> Draft202012Validator:
     return Draft202012Validator(load_event_schema(), format_checker=FormatChecker())
 
